@@ -1,0 +1,1406 @@
+#!/usr/bin/env python3
+"""
+Sistema de Presentaciones USB para Raspberry Pi
+Versión Final Corregida - Navegación USB Arreglada
+"""
+
+import os
+import subprocess
+from pathlib import Path
+import tkinter as tk
+from tkinter import messagebox, Toplevel
+import threading
+import time
+from datetime import datetime
+import signal
+import sys
+import atexit
+import shutil
+import tempfile
+import hashlib
+
+class SimplePresenter:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Sistema de Presentaciones USB")
+        self.root.attributes('-fullscreen', True)
+        
+        # Colores del tema oscuro
+        self.colors = {
+            'bg_main': '#1E1E1E',
+            'bg_panel': '#2B2B2B',
+            'text_primary': '#FFFFFF',
+            'text_secondary': '#B0B0B0',
+            'accent_blue': '#2979FF',
+            'accent_green': '#2ECC71',
+            'accent_yellow': '#F1C40F',
+            'accent_red': '#E74C3C'
+        }
+        
+        # TAMAÑOS DE FUENTE
+        self.FONT_SIZES = {
+            'title': 28,
+            'header': 26,
+            'normal': 24,
+            'list': 26,
+            'button': 22,
+            'small': 20,
+            'clock': 24
+        }
+        
+        # OPTIMIZACIÓN: Configuración
+        self.MAX_ITEMS_DISPLAY = 100
+        self.CACHE_USB_INFO = {}
+        
+        # Directorio temporal para conversiones (oculto)
+        self.temp_conversion_dir = os.path.join(tempfile.gettempdir(), '.usb_presenter_cache')
+        os.makedirs(self.temp_conversion_dir, exist_ok=True)
+        
+        # Estado de diálogos activos
+        self.active_dialog = None
+        self.dialog_selection = 0
+        self.selecting_usb = False
+        
+        signal.signal(signal.SIGINT, lambda s, f: self.close_app())
+        
+        # Estado
+        self.usb_devices = []
+        self.current_usb_root = None
+        self.current_path = str(Path.home())
+        self.current_items = []
+        self.all_items = []
+        self.monitoring = True
+        self.active_processes = []
+        self.current_selection = 0
+        self.messagebox_active = False
+        self.loading = False
+        
+        # Detectar visores y conversores
+        self.pdf_viewer = self._detect_pdf_viewer()
+        self.pptx_converter = self._detect_pptx_converter()
+        
+        print(f"[SISTEMA] Visor PDF: {self.pdf_viewer or 'NINGUNO'}")
+        print(f"[SISTEMA] Conversor PPTX: {self.pptx_converter or 'LibreOffice'}")
+        print(f"[SISTEMA] Directorio temporal: {self.temp_conversion_dir}")
+        
+        atexit.register(self._cleanup)
+        
+        self._setup_ui()
+        self.scan_usb_devices()
+        self._start_usb_monitor()
+        self._start_clock()
+        self.root.after(100, self._focus_list)
+    
+    def _detect_pptx_converter(self):
+        """Detecta el mejor conversor PPTX→PDF disponible"""
+        for converter in ['unoconv', 'libreoffice']:
+            try:
+                if subprocess.run(['which', converter], capture_output=True).returncode == 0:
+                    return converter
+            except:
+                pass
+        return None
+    
+    def _detect_pdf_viewer(self):
+        """Detecta el mejor visor PDF disponible"""
+        for viewer in ['okular', 'evince', 'qpdfview']:
+            try:
+                if subprocess.run(['which', viewer], capture_output=True).returncode == 0:
+                    return viewer
+            except:
+                pass
+        return None
+    
+    def _cleanup(self):
+        """Limpieza al salir"""
+        for proc in self.active_processes:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1)
+            except:
+                try:
+                    proc.kill()
+                except:
+                    pass
+        
+        try:
+            if os.path.exists(self.temp_conversion_dir):
+                shutil.rmtree(self.temp_conversion_dir)
+                print(f"[LIMPIEZA] Directorio temporal eliminado")
+        except Exception as e:
+            print(f"[LIMPIEZA] Error al limpiar: {e}")
+    
+    def _get_cached_pdf_path(self, pptx_path):
+        """Genera ruta única para PDF en cache temporal"""
+        file_hash = hashlib.md5(pptx_path.encode()).hexdigest()[:12]
+        filename = os.path.basename(pptx_path)
+        name_without_ext = os.path.splitext(filename)[0]
+        
+        pdf_filename = f"{name_without_ext}_{file_hash}.pdf"
+        return os.path.join(self.temp_conversion_dir, pdf_filename)
+    
+    def _is_pdf_cache_valid(self, pptx_path, pdf_path):
+        """Verifica si el PDF en cache es válido y actual"""
+        if not os.path.exists(pdf_path):
+            return False
+        
+        try:
+            pptx_mtime = os.path.getmtime(pptx_path)
+            pdf_mtime = os.path.getmtime(pdf_path)
+            
+            if pdf_mtime >= pptx_mtime:
+                if os.path.getsize(pdf_path) > 1024:
+                    return True
+        except:
+            pass
+        
+        return False
+    
+    def _convert_pptx_to_pdf_optimized(self, pptx_path):
+        """Convierte PPTX a PDF de forma optimizada"""
+        pdf_cache_path = self._get_cached_pdf_path(pptx_path)
+        
+        if self._is_pdf_cache_valid(pptx_path, pdf_cache_path):
+            print(f"[CACHE] PDF válido encontrado: {os.path.basename(pdf_cache_path)}")
+            return pdf_cache_path
+        
+        print(f"[CONVERSIÓN] Convirtiendo: {os.path.basename(pptx_path)}")
+        
+        os.makedirs(os.path.dirname(pdf_cache_path), exist_ok=True)
+        
+        try:
+            if self.pptx_converter == 'unoconv':
+                print("[CONVERSIÓN] Usando unoconv (rápido)...")
+                result = subprocess.run([
+                    'unoconv',
+                    '-f', 'pdf',
+                    '-o', pdf_cache_path,
+                    pptx_path
+                ], 
+                capture_output=True, 
+                timeout=45,
+                text=True)
+                
+                if result.returncode == 0 and os.path.exists(pdf_cache_path):
+                    print(f"[CONVERSIÓN] ✓ Éxito con unoconv ({os.path.getsize(pdf_cache_path)} bytes)")
+                    return pdf_cache_path
+                else:
+                    print(f"[CONVERSIÓN] unoconv falló: {result.stderr}")
+            
+            print("[CONVERSIÓN] Usando LibreOffice headless...")
+            
+            temp_dir = tempfile.mkdtemp(prefix='lo_convert_')
+            
+            try:
+                result = subprocess.run([
+                    'libreoffice',
+                    '--headless',
+                    '--convert-to', 'pdf',
+                    '--outdir', temp_dir,
+                    pptx_path
+                ], 
+                capture_output=True, 
+                timeout=60,
+                text=True)
+                
+                for file in os.listdir(temp_dir):
+                    if file.endswith('.pdf'):
+                        temp_pdf = os.path.join(temp_dir, file)
+                        shutil.move(temp_pdf, pdf_cache_path)
+                        print(f"[CONVERSIÓN] ✓ Éxito con LibreOffice ({os.path.getsize(pdf_cache_path)} bytes)")
+                        return pdf_cache_path
+                
+                print(f"[CONVERSIÓN] LibreOffice no generó PDF: {result.stderr}")
+                
+            finally:
+                try:
+                    shutil.rmtree(temp_dir)
+                except:
+                    pass
+            
+        except subprocess.TimeoutExpired:
+            print("[CONVERSIÓN] ⏱️ Timeout - archivo muy grande o sistema lento")
+        except Exception as e:
+            print(f"[CONVERSIÓN] ❌ Error: {e}")
+        
+        return None
+    
+    def _setup_ui(self):
+        self.root.configure(bg=self.colors['bg_main'])
+        
+        # Barra superior
+        top_bar = tk.Frame(self.root, bg=self.colors['bg_panel'], height=80)
+        top_bar.pack(fill=tk.X)
+        top_bar.pack_propagate(False)
+        
+        self.clock_label = tk.Label(
+            top_bar, 
+            text="", 
+            font=('Arial', self.FONT_SIZES['clock'], 'bold'),
+            bg=self.colors['bg_panel'], 
+            fg=self.colors['text_primary']
+        )
+        self.clock_label.pack(side=tk.LEFT, padx=25)
+        
+        tk.Label(
+            top_bar, 
+            text="SISTEMA DE PRESENTACIONES USB", 
+            font=('Arial', self.FONT_SIZES['title'], 'bold'),
+            bg=self.colors['bg_panel'], 
+            fg=self.colors['text_primary']
+        ).pack(side=tk.LEFT, expand=True)
+        
+        # Ruta actual
+        path_frame = tk.Frame(self.root, bg=self.colors['bg_panel'])
+        path_frame.pack(fill=tk.X, padx=20, pady=(10, 0))
+        
+        self.path_label = tk.Label(
+            path_frame, 
+            text="", 
+            font=('Arial', self.FONT_SIZES['normal']),
+            bg=self.colors['bg_panel'], 
+            fg=self.colors['text_secondary'], 
+            pady=12,
+            anchor='w', 
+            padx=20
+        )
+        self.path_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        self.loading_label = tk.Label(
+            path_frame,
+            text="",
+            font=('Arial', self.FONT_SIZES['small']),
+            bg=self.colors['bg_panel'],
+            fg=self.colors['accent_yellow']
+        )
+        self.loading_label.pack(side=tk.RIGHT, padx=20)
+        
+        # Lista de archivos
+        list_frame = tk.Frame(self.root, bg=self.colors['bg_main'])
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        scrollbar = tk.Scrollbar(list_frame, bg=self.colors['bg_panel'], width=30)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.listbox = tk.Listbox(
+            list_frame, 
+            font=('Arial', self.FONT_SIZES['list'], 'bold'),
+            height=10,
+            yscrollcommand=scrollbar.set, 
+            selectbackground=self.colors['accent_blue'], 
+            selectforeground=self.colors['text_primary'],
+            bg=self.colors['bg_panel'],
+            fg=self.colors['text_primary'],
+            activestyle='none',
+            highlightthickness=0,
+            borderwidth=0,
+            selectmode=tk.SINGLE
+        )
+        self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=self.listbox.yview)
+        self.listbox.bind('<Double-Button-1>', lambda e: self._open_item())
+        
+        # Botones
+        self.button_frame = tk.Frame(self.root, bg=self.colors['bg_main'])
+        self.button_frame.pack(fill=tk.X, padx=20, pady=(0, 20))
+        
+        self.buttons = []
+        button_configs = [
+            ("SELECCIONAR USB", self._show_usb_selector, self.colors['accent_blue']),
+            ("ACTUALIZAR", self.scan_usb_devices, self.colors['accent_green']),
+            ("APAGAR SISTEMA", self._show_shutdown_dialog, self.colors['accent_red'])
+        ]
+        
+        for text, cmd, bg in button_configs:
+            btn = tk.Button(
+                self.button_frame, 
+                text=text, 
+                command=cmd,
+                font=('Arial', self.FONT_SIZES['button'], 'bold'),
+                height=3,
+                bg=bg, 
+                fg=self.colors['text_primary'],
+                activebackground=bg,
+                activeforeground=self.colors['text_primary'],
+                relief=tk.FLAT,
+                bd=0,
+                cursor='hand2',
+                padx=10
+            )
+            btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+            self.buttons.append(btn)
+        
+        # Atajos de teclado
+        self.root.bind('b', self._handle_b_press)
+        self.root.bind('B', self._handle_b_press)
+        self.root.bind('<Escape>', self._handle_back_press)
+        self.root.bind('<Up>', self._handle_up)
+        self.root.bind('<Down>', self._handle_down)
+        self.root.bind('<Left>', self._handle_left)
+        self.root.bind('<Right>', self._handle_right)
+        self.root.bind('<Prior>', self._handle_up)
+        self.root.bind('<Next>', self._handle_down)
+        self.root.bind('<Return>', self._open_item)
+        self.root.bind('<space>', self._open_item)
+        self.root.bind('<F5>', lambda e: self.scan_usb_devices())
+        self.root.bind('<F11>', lambda e: self.root.attributes('-fullscreen', 
+                                                    not self.root.attributes('-fullscreen')))
+        self.root.bind('<Control-q>', self.close_app)
+    
+    def _handle_key_in_dialog(self, event):
+        """Maneja teclas en diálogos activos - CORREGIDO"""
+        if not self.active_dialog:
+            return
+        
+        dialog_type = self.active_dialog.dialog_type
+        
+        if dialog_type == "shutdown":
+            if event.keysym in ['b', 'B', 'Return']:
+                if self.dialog_selection == 1:
+                    self._execute_shutdown()
+                elif self.dialog_selection == 2:
+                    self.active_dialog.destroy()
+                    self.active_dialog = None
+                    self._focus_list()
+            elif event.keysym == 'Escape':
+                self.active_dialog.destroy()
+                self.active_dialog = None
+                self._focus_list()
+            elif event.keysym == 'Left':
+                self.dialog_selection = max(1, self.dialog_selection - 1)
+                self._highlight_dialog_buttons()
+            elif event.keysym == 'Right':
+                self.dialog_selection = min(2, self.dialog_selection + 1)
+                self._highlight_dialog_buttons()
+        
+        elif dialog_type == "usb_selector":
+            if event.keysym == 'Escape':
+                self.active_dialog.destroy()
+                self.active_dialog = None
+                self.selecting_usb = False
+                self._focus_list()
+            elif event.keysym in ['b', 'B', 'Return']:
+                if hasattr(self.active_dialog, 'select_btn'):
+                    self.active_dialog.select_btn.invoke()
+            elif event.keysym in ['Up', 'Down', 'Prior', 'Next']:
+                # CORREGIDO: Manejar navegación en lista USB
+                usb_list = self.active_dialog.usb_list
+                current = usb_list.curselection()
+                item_count = usb_list.size()
+                
+                if not current and item_count > 0:
+                    # No hay selección, seleccionar el primero
+                    usb_list.selection_set(0)
+                    usb_list.activate(0)
+                    usb_list.see(0)
+                elif current:
+                    # Hay selección, moverla
+                    direction = -1 if event.keysym in ['Up', 'Prior'] else 1
+                    new_idx = current[0] + direction
+                    if 0 <= new_idx < item_count:
+                        usb_list.selection_clear(0, tk.END)
+                        usb_list.selection_set(new_idx)
+                        usb_list.activate(new_idx)
+                        usb_list.see(new_idx)
+    
+    def _show_converting_message(self, filename):
+        """Muestra mensaje de conversión en progreso"""
+        msg = Toplevel(self.root)
+        msg.title("Convirtiendo")
+        msg.configure(bg=self.colors['bg_main'])
+        msg.overrideredirect(True)
+        msg.transient(self.root)
+        
+        w, h = 700, 300
+        x = (self.root.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.root.winfo_screenheight() // 2) - (h // 2)
+        msg.geometry(f'{w}x{h}+{x}+{y}')
+        
+        tk.Label(
+            msg, 
+            text="🔄", 
+            font=('Segoe UI Emoji', 50),
+            bg=self.colors['bg_main']
+        ).pack(pady=20)
+        
+        tk.Label(
+            msg, 
+            text="Convirtiendo presentación...",
+            font=('Arial', 28, 'bold'),
+            bg=self.colors['bg_main'],
+            fg=self.colors['text_primary']
+        ).pack()
+        
+        display_name = filename[:45] + "..." if len(filename) > 45 else filename
+        tk.Label(
+            msg, 
+            text=display_name,
+            font=('Arial', 22),
+            bg=self.colors['bg_main'],
+            fg=self.colors['text_secondary']
+        ).pack(pady=15)
+        
+        progress = tk.Label(
+            msg, 
+            text="▰▰▰▱▱▱▱▱▱",
+            font=('Arial', 32),
+            bg=self.colors['bg_main'],
+            fg=self.colors['accent_blue']
+        )
+        progress.pack(pady=20)
+        
+        def animate_progress(step=0):
+            patterns = [
+                "▰▱▱▱▱▱▱▱▱", "▰▰▱▱▱▱▱▱▱", "▰▰▰▱▱▱▱▱▱",
+                "▰▰▰▰▱▱▱▱▱", "▰▰▰▰▰▱▱▱▱", "▰▰▰▰▰▰▱▱▱",
+                "▰▰▰▰▰▰▰▱▱", "▰▰▰▰▰▰▰▰▱", "▰▰▰▰▰▰▰▰▰"
+            ]
+            if msg.winfo_exists():
+                progress.config(text=patterns[step % len(patterns)])
+                msg.after(250, animate_progress, step + 1)
+        
+        animate_progress()
+        msg.update()
+        
+        return msg
+    
+    def _show_loading(self, show=True):
+        """Muestra/oculta indicador de carga"""
+        if show:
+            self.loading_label.config(text="⏳ Cargando...")
+            self.loading = True
+        else:
+            self.loading_label.config(text="")
+            self.loading = False
+        self.root.update_idletasks()
+    
+    def _focus_list(self):
+        """Enfoca la lista"""
+        self.current_selection = 0
+        self.listbox.focus_set()
+        if self.current_items:
+            self.listbox.selection_set(0)
+            self.listbox.activate(0)
+        self._highlight_current()
+    
+    def _highlight_current(self):
+        """Resalta selección actual"""
+        for i, btn in enumerate(self.buttons):
+            if i == self.current_selection - 1 and self.current_selection > 0:
+                btn.config(relief=tk.SOLID, bd=4, highlightbackground='white', highlightthickness=2)
+            else:
+                btn.config(relief=tk.FLAT, bd=0, highlightbackground=self.colors['bg_main'], highlightthickness=0)
+        
+        if self.current_selection == 0:
+            self.listbox.config(selectbackground=self.colors['accent_blue'])
+    
+    def _handle_b_press(self, e=None):
+        """Tecla 'b' - Abrir/Aceptar"""
+        if self.active_dialog:
+            self._handle_key_in_dialog(e)
+            return
+        
+        if self.messagebox_active:
+            self.root.after(10, self._press_messagebox_ok)
+            return
+        
+        if self.current_selection == 0:
+            self._open_item()
+        else:
+            btn_index = self.current_selection - 1
+            if 0 <= btn_index < len(self.buttons):
+                self.buttons[btn_index].invoke()
+    
+    def _press_messagebox_ok(self):
+        """Presiona OK en messagebox"""
+        try:
+            for widget in self.root.winfo_children():
+                if isinstance(widget, Toplevel):
+                    for child in widget.winfo_children():
+                        if isinstance(child, tk.Button) and \
+                           child.cget('text').upper() in ['OK', 'ACEPTAR', 'YES', 'SI']:
+                            child.invoke()
+                            self.messagebox_active = False
+                            return
+        except:
+            pass
+    
+    def _handle_back_press(self, e=None):
+        """Tecla ESC - Retroceder - CORREGIDO"""
+        if self.active_dialog:
+            self._handle_key_in_dialog(e)
+            return
+        
+        if self.messagebox_active:
+            self.root.after(10, self._press_messagebox_cancel)
+            return
+        
+        if self.selecting_usb:
+            self.selecting_usb = False
+            self._load_directory()
+            return
+        
+        if self.current_selection == 0:
+            self._go_back()
+        else:
+            self.current_selection = 0
+            self._focus_list()
+    
+    def _press_messagebox_cancel(self):
+        """Presiona Cancelar en messagebox"""
+        try:
+            for widget in self.root.winfo_children():
+                if isinstance(widget, Toplevel):
+                    for child in widget.winfo_children():
+                        if isinstance(child, tk.Button) and \
+                           child.cget('text').upper() in ['CANCEL', 'CANCELAR', 'NO']:
+                            child.invoke()
+                            self.messagebox_active = False
+                            return
+        except:
+            pass
+    
+    def _handle_up(self, e=None):
+        """Flecha arriba - CORREGIDO"""
+        if self.active_dialog:
+            self._handle_key_in_dialog(e)
+            return
+        
+        if self.current_selection == 0:
+            self._move_selection(-1)
+        else:
+            self.current_selection = 0
+            self._focus_list()
+    
+    def _handle_down(self, e=None):
+        """Flecha abajo - CORREGIDO"""
+        if self.active_dialog:
+            self._handle_key_in_dialog(e)
+            return
+        
+        if self.current_selection == 0:
+            sel = self.listbox.curselection()
+            if sel and sel[0] == len(self.current_items) - 1:
+                self.current_selection = 1
+                self._highlight_current()
+            else:
+                self._move_selection(1)
+        else:
+            self.current_selection = (self.current_selection % 3) + 1
+            self._highlight_current()
+    
+    def _handle_left(self, e=None):
+        """Flecha izquierda"""
+        if self.active_dialog:
+            self._handle_key_in_dialog(e)
+            return
+        
+        if self.current_selection > 0:
+            self.current_selection = max(1, self.current_selection - 1)
+            self._highlight_current()
+    
+    def _handle_right(self, e=None):
+        """Flecha derecha"""
+        if self.active_dialog:
+            self._handle_key_in_dialog(e)
+            return
+        
+        if self.current_selection > 0:
+            self.current_selection = min(3, self.current_selection + 1)
+            self._highlight_current()
+        elif self.current_selection == 0:
+            self.current_selection = 1
+            self._highlight_current()
+    
+    def _start_clock(self):
+        """Inicia reloj"""
+        def update():
+            while self.monitoring:
+                now = datetime.now()
+                text = f"{now.strftime('%H:%M:%S')} | {now.strftime('%d/%m/%Y')}"
+                self.root.after(0, lambda: self.clock_label.config(text=text))
+                time.sleep(1)
+        threading.Thread(target=update, daemon=True).start()
+    
+    def _show_shutdown_dialog(self):
+        """Muestra diálogo de apagado"""
+        if self.active_dialog:
+            return
+        
+        dialog = Toplevel(self.root)
+        dialog.title("Confirmar Apagado")
+        dialog.configure(bg=self.colors['bg_main'])
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        dialog.dialog_type = "shutdown"
+        self.active_dialog = dialog
+        self.dialog_selection = 1
+        
+        w, h = 800, 400
+        x = (self.root.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.root.winfo_screenheight() // 2) - (h // 2)
+        dialog.geometry(f'{w}x{h}+{x}+{y}')
+        
+        border = tk.Frame(dialog, bg=self.colors['accent_red'], bd=6)
+        border.pack(fill=tk.BOTH, expand=True)
+        
+        content = tk.Frame(border, bg=self.colors['bg_main'])
+        content.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        
+        header = tk.Frame(content, bg=self.colors['accent_red'], height=80)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        
+        tk.Label(
+            header,
+            text="⚠️  APAGAR SISTEMA",
+            font=('Arial', 30, 'bold'),
+            bg=self.colors['accent_red'],
+            fg='white'
+        ).pack(pady=20)
+        
+        tk.Label(
+            content,
+            text="¿Confirma el apagado del sistema?\n\n"
+                 "Se cerrarán todas las aplicaciones y\n"
+                 "se apagará la Raspberry Pi.",
+            font=('Arial', 26),
+            bg=self.colors['bg_main'],
+            fg=self.colors['text_primary'],
+            justify='center'
+        ).pack(pady=30)
+        
+        btn_frame = tk.Frame(content, bg=self.colors['bg_main'])
+        btn_frame.pack(pady=(0, 30))
+        
+        cancel_btn = tk.Button(
+            btn_frame,
+            text="CANCELAR",
+            command=lambda: [dialog.destroy(), setattr(self, 'active_dialog', None), self._focus_list()],
+            font=('Arial', 26, 'bold'),
+            bg='#616161',
+            fg='white',
+            relief=tk.FLAT,
+            width=22,
+            height=2,
+            cursor='hand2',
+            padx=20,
+            pady=10
+        )
+        cancel_btn.pack(side=tk.LEFT, padx=30)
+        
+        confirm_btn = tk.Button(
+            btn_frame,
+            text="CONFIRMAR",
+            command=self._execute_shutdown,
+            font=('Arial', 26, 'bold'),
+            bg=self.colors['accent_red'],
+            fg='white',
+            relief=tk.FLAT,
+            width=22,
+            height=2,
+            cursor='hand2',
+            padx=20,
+            pady=10
+        )
+        confirm_btn.pack(side=tk.RIGHT, padx=30)
+        
+        dialog.cancel_btn = cancel_btn
+        dialog.confirm_btn = confirm_btn
+        
+        dialog.bind('b', self._handle_key_in_dialog)
+        dialog.bind('B', self._handle_key_in_dialog)
+        dialog.bind('<Escape>', self._handle_key_in_dialog)
+        dialog.bind('<Left>', self._handle_key_in_dialog)
+        dialog.bind('<Right>', self._handle_key_in_dialog)
+        dialog.bind('<Return>', self._handle_key_in_dialog)
+        
+        self._highlight_dialog_buttons()
+        dialog.focus_set()
+    
+    def _highlight_dialog_buttons(self):
+        """Destaca el botón actualmente seleccionado"""
+        if not self.active_dialog or not hasattr(self.active_dialog, 'dialog_type'):
+            return
+        
+        if self.active_dialog.dialog_type == "shutdown":
+            if self.dialog_selection == 1:
+                self.active_dialog.confirm_btn.config(
+                    relief=tk.SOLID, bd=4,
+                    highlightbackground='white', highlightthickness=2
+                )
+                self.active_dialog.cancel_btn.config(
+                    relief=tk.FLAT, bd=0,
+                    highlightbackground=self.active_dialog.cancel_btn.cget('bg'),
+                    highlightthickness=0
+                )
+            elif self.dialog_selection == 2:
+                self.active_dialog.cancel_btn.config(
+                    relief=tk.SOLID, bd=4,
+                    highlightbackground='white', highlightthickness=2
+                )
+                self.active_dialog.confirm_btn.config(
+                    relief=tk.FLAT, bd=0,
+                    highlightbackground=self.active_dialog.confirm_btn.cget('bg'),
+                    highlightthickness=0
+                )
+    
+    def _execute_shutdown(self):
+        """Ejecuta el apagado"""
+        print("[SISTEMA] Apagando...")
+        self.monitoring = False
+        
+        for proc in self.active_processes:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1)
+            except:
+                try:
+                    proc.kill()
+                except:
+                    pass
+        
+        if self.active_dialog:
+            self.active_dialog.destroy()
+            self.active_dialog = None
+        
+        time.sleep(0.5)
+        subprocess.run(['sudo', 'shutdown', '-h', 'now'])
+    
+    def _show_info_message(self, title, message, timeout=3000):
+        """Mensaje informativo"""
+        self.messagebox_active = True
+        
+        info = Toplevel(self.root)
+        info.title(title)
+        info.configure(bg=self.colors['bg_main'])
+        info.transient(self.root)
+        info.overrideredirect(True)
+        
+        info.update_idletasks()
+        w, h = 800, 350
+        x = (self.root.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.root.winfo_screenheight() // 2) - (h // 2)
+        info.geometry(f'{w}x{h}+{x}+{y}')
+        
+        tk.Label(
+            info, 
+            text=title, 
+            font=('Arial', 30, 'bold'),
+            bg=self.colors['bg_main'], 
+            fg=self.colors['text_primary'], 
+            pady=25
+        ).pack()
+        
+        tk.Label(
+            info, 
+            text=message, 
+            font=('Arial', 26),
+            bg=self.colors['bg_main'], 
+            fg=self.colors['text_secondary'], 
+            wraplength=750,
+            justify='center'
+        ).pack(pady=25)
+        
+        count_label = tk.Label(
+            info, 
+            text="", 
+            font=('Arial', 24),
+            bg=self.colors['bg_main'], 
+            fg=self.colors['text_secondary']
+        )
+        count_label.pack(pady=15)
+        
+        def countdown(sec):
+            if sec > 0:
+                count_label.config(text=f"Desaparece en {sec} segundos...")
+                info.after(1000, countdown, sec - 1)
+            else:
+                info.destroy()
+                self.messagebox_active = False
+        
+        close_btn = tk.Button(
+            info, 
+            text="OK", 
+            command=lambda: [info.destroy(), setattr(self, 'messagebox_active', False)],
+            font=('Arial', 26, 'bold'),
+            bg=self.colors['accent_blue'], 
+            fg=self.colors['text_primary'], 
+            width=20,
+            height=2,
+            relief=tk.FLAT,
+            cursor='hand2',
+            padx=20,
+            pady=10
+        )
+        close_btn.pack(pady=25)
+        
+        info.bind('b', lambda e: close_btn.invoke())
+        info.bind('B', lambda e: close_btn.invoke())
+        
+        countdown(timeout // 1000)
+        info.after(100, close_btn.focus_set)
+    
+    def _start_usb_monitor(self):
+        """Monitor de USB"""
+        def monitor():
+            last_count = len(self.usb_devices)
+            while self.monitoring:
+                self._find_usb()
+                current = len(self.usb_devices)
+                if current != last_count:
+                    self.root.after(0, self._update_usb_display)
+                    if current > last_count and self.usb_devices:
+                        self.root.after(0, self._on_new_usb)
+                    last_count = current
+                time.sleep(3)
+        threading.Thread(target=monitor, daemon=True).start()
+    
+    def _find_usb(self):
+        """Busca dispositivos USB montados"""
+        usbs = set()
+        
+        for base in [f"/media/{os.getenv('USER')}", "/media", "/mnt"]:
+            path = Path(base)
+            if not path.exists():
+                continue
+            
+            try:
+                for item in path.iterdir():
+                    if item.is_dir() and os.path.ismount(str(item)):
+                        usbs.add(str(item))
+            except (PermissionError, OSError):
+                pass
+        
+        self.usb_devices = sorted(list(usbs))
+        return self.usb_devices
+    
+    def _update_usb_display(self):
+        """Actualiza indicador de USB"""
+        if not self.usb_devices:
+            self.path_label.config(
+                text="📭 Sin USB conectado", 
+                fg=self.colors['accent_red']
+            )
+        elif len(self.usb_devices) == 1:
+            name = Path(self.usb_devices[0]).name
+            self.path_label.config(
+                text=f"📀 USB: {name}", 
+                fg=self.colors['accent_green']
+            )
+        else:
+            self.path_label.config(
+                text=f"📀 {len(self.usb_devices)} dispositivos USB", 
+                fg=self.colors['accent_green']
+            )
+    
+    def _on_new_usb(self):
+        """Nuevo USB detectado"""
+        if len(self.usb_devices) == 1:
+            self._set_current_usb(self.usb_devices[0])
+    
+    def _set_current_usb(self, usb_path):
+        """Establece USB actual"""
+        self.current_usb_root = usb_path
+        self.current_path = usb_path
+        self.selecting_usb = False
+        self._load_directory()
+    
+    def scan_usb_devices(self, e=None):
+        """Escanea dispositivos USB - CORREGIDO"""
+        # Si hay diálogo activo, ignorar
+        if self.active_dialog:
+            return
+        
+        # CORRECCIÓN: Si ya tenemos un USB seleccionado y hay múltiples,
+        # recargar el directorio actual en lugar de mostrar selector
+        if self.current_usb_root and len(self.usb_devices) > 1:
+            print("[ACTUALIZAR] Recargando directorio actual...")
+            self._load_directory()
+            return
+        
+        self._show_loading(True)
+        
+        def scan_thread():
+            self._find_usb()
+            self.root.after(0, self._update_usb_display)
+            
+            if not self.usb_devices:
+                self.root.after(0, lambda: self._show_no_usb())
+            elif len(self.usb_devices) == 1:
+                self.root.after(0, lambda: self._set_current_usb(self.usb_devices[0]))
+            else:
+                # Múltiples USB - solo actualizar si no hay uno seleccionado
+                if not self.current_usb_root:
+                    self.root.after(0, lambda: self.path_label.config(
+                        text=f"📀 {len(self.usb_devices)} USB - Use SELECCIONAR USB",
+                        fg=self.colors['accent_yellow']
+                    ))
+            
+            self.root.after(0, lambda: self._show_loading(False))
+        
+        threading.Thread(target=scan_thread, daemon=True).start()
+    
+    def _show_no_usb(self):
+        """Muestra mensaje de sin USB"""
+        self.listbox.delete(0, tk.END)
+        self.listbox.insert(tk.END, "")
+        self.listbox.insert(tk.END, "  No hay dispositivos USB conectados")
+        self.listbox.insert(tk.END, "  Conecte un USB y presione ACTUALIZAR")
+        self.current_usb_root = None
+    
+    def _show_usb_selector(self):
+        """Selector de USB - CORREGIDO"""
+        if not self.usb_devices:
+            self._show_info_message("Sin USB", 
+                "No hay dispositivos USB detectados.\n\n"
+                "Conecte un dispositivo USB y presione ACTUALIZAR.")
+            return
+        
+        if self.active_dialog:
+            return
+        
+        self.selecting_usb = True
+        
+        selector = Toplevel(self.root)
+        selector.title("Seleccionar USB")
+        selector.geometry("1100x800")
+        selector.transient(self.root)
+        selector.grab_set()
+        selector.configure(bg=self.colors['bg_main'])
+        
+        selector.dialog_type = "usb_selector"
+        self.active_dialog = selector
+        
+        selector.update_idletasks()
+        w, h = selector.winfo_width(), selector.winfo_height()
+        x = (self.root.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.root.winfo_screenheight() // 2) - (h // 2)
+        selector.geometry(f'{w}x{h}+{x}+{y}')
+        
+        tk.Label(
+            selector, 
+            text="SELECCIONE DISPOSITIVO USB", 
+            font=('Arial', 32, 'bold'),
+            bg=self.colors['bg_main'], 
+            fg=self.colors['text_primary'], 
+            pady=40
+        ).pack()
+        
+        list_frame = tk.Frame(selector, bg=self.colors['bg_main'])
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=60, pady=30)
+        
+        scrollbar = tk.Scrollbar(list_frame, bg=self.colors['bg_panel'], width=40)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        usb_list = tk.Listbox(
+            list_frame, 
+            font=('Arial', 28),
+            height=8,
+            yscrollcommand=scrollbar.set,
+            selectbackground=self.colors['accent_blue'], 
+            selectforeground=self.colors['text_primary'],
+            bg=self.colors['bg_panel'],
+            fg=self.colors['text_primary'],
+            activestyle='none',
+            highlightthickness=0,
+            borderwidth=0
+        )
+        usb_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=usb_list.yview)
+        
+        for i, usb in enumerate(self.usb_devices):
+            name = Path(usb).name
+            try:
+                total, _, free = shutil.disk_usage(usb)
+                info = f"  [{i+1}] {name}  ({free/(1024**3):.1f}GB libre de {total/(1024**3):.1f}GB)"
+            except:
+                info = f"  [{i+1}] {name}"
+            usb_list.insert(tk.END, info)
+        
+        usb_list.selection_set(0)
+        usb_list.activate(0)
+        
+        btn_frame = tk.Frame(selector, bg=self.colors['bg_main'])
+        btn_frame.pack(fill=tk.X, padx=60, pady=40)
+        
+        def select():
+            sel = usb_list.curselection()
+            if sel:
+                self.selecting_usb = False
+                selected_usb = self.usb_devices[sel[0]]
+                selector.destroy()
+                self.active_dialog = None
+                self._set_current_usb(selected_usb)
+        
+        select_btn = tk.Button(
+            btn_frame, 
+            text="SELECCIONAR", 
+            command=select,
+            font=('Arial', 28, 'bold'),
+            bg=self.colors['accent_green'], 
+            fg=self.colors['text_primary'],
+            height=3,
+            width=22,
+            relief=tk.FLAT,
+            cursor='hand2',
+            padx=20,
+            pady=10
+        )
+        select_btn.pack(side=tk.LEFT, padx=20, expand=True)
+        
+        cancel_btn = tk.Button(
+            btn_frame, 
+            text="CANCELAR", 
+            command=lambda: [
+                selector.destroy(), 
+                setattr(self, 'active_dialog', None), 
+                setattr(self, 'selecting_usb', False),
+                self._focus_list()
+            ],
+            font=('Arial', 28, 'bold'),
+            bg=self.colors['accent_red'], 
+            fg=self.colors['text_primary'],
+            height=3,
+            width=22,
+            relief=tk.FLAT,
+            cursor='hand2',
+            padx=20,
+            pady=10
+        )
+        cancel_btn.pack(side=tk.RIGHT, padx=20, expand=True)
+        
+        selector.select_btn = select_btn
+        selector.cancel_btn = cancel_btn
+        selector.usb_list = usb_list
+        
+        # IMPORTANTE: Bind de todas las teclas necesarias
+        selector.bind('b', self._handle_key_in_dialog)
+        selector.bind('B', self._handle_key_in_dialog)
+        selector.bind('<Escape>', self._handle_key_in_dialog)
+        selector.bind('<Return>', self._handle_key_in_dialog)
+        selector.bind('<Up>', self._handle_key_in_dialog)
+        selector.bind('<Down>', self._handle_key_in_dialog)
+        selector.bind('<Prior>', self._handle_key_in_dialog)
+        selector.bind('<Next>', self._handle_key_in_dialog)
+        
+        selector.after(100, usb_list.focus_set)
+    
+    def _load_directory(self):
+        """Carga directorio actual"""
+        if self.active_dialog:
+            return
+            
+        self._show_loading(True)
+        
+        def load_thread():
+            try:
+                self.listbox.delete(0, tk.END)
+                
+                if self.current_usb_root:
+                    try:
+                        rel = os.path.relpath(self.current_path, self.current_usb_root)
+                        name = Path(self.current_usb_root).name
+                        display = f"USB: {name}" if rel == '.' else f"{name} > {rel}"
+                        self.root.after(0, lambda: self.path_label.config(
+                            text=f"📀 USB: {name} | 📁 {display}", 
+                            fg=self.colors['accent_green']
+                        ))
+                    except:
+                        self.root.after(0, lambda: self.path_label.config(
+                            text=f"📁 {self.current_path}", 
+                            fg=self.colors['accent_green']
+                        ))
+                else:
+                    self.root.after(0, lambda: self.path_label.config(
+                        text="📭 Conecte un dispositivo USB", 
+                        fg=self.colors['accent_red']
+                    ))
+                
+                self.current_items = []
+                
+                doc_ext = {'.pdf', '.pptx', '.ppt', '.odp'}
+                img_ext = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff'}
+                
+                path = Path(self.current_path)
+                if not path.exists():
+                    self.root.after(0, lambda: self.listbox.insert(tk.END, "  ❌  Ruta no existe"))
+                    return
+                
+                items = []
+                count = 0
+                
+                try:
+                    for item in path.iterdir():
+                        if item.name.startswith('.'):
+                            continue
+                        
+                        if item.is_dir() or item.suffix.lower() in doc_ext or item.suffix.lower() in img_ext:
+                            items.append(item)
+                            count += 1
+                            
+                            if count >= self.MAX_ITEMS_DISPLAY * 2:
+                                break
+                    
+                    items.sort(key=lambda x: (not x.is_dir(), x.name.lower()))
+                    total_items = len(items)
+                    items = items[:self.MAX_ITEMS_DISPLAY]
+                    
+                    batch_size = 20
+                    for i in range(0, len(items), batch_size):
+                        batch = items[i:i+batch_size]
+                        display_items = []
+                        
+                        for item in batch:
+                            if item.is_dir():
+                                display_items.append((f"📁  {item.name}", item))
+                            elif item.suffix.lower() in doc_ext:
+                                if item.suffix.lower() != '.pdf':
+                                    pdf_cache = self._get_cached_pdf_path(str(item))
+                                    icon = "📊✓" if os.path.exists(pdf_cache) else "📊"
+                                else:
+                                    icon = "📕"
+                                display_items.append((f"{icon}  {item.name}", item))
+                            elif item.suffix.lower() in img_ext:
+                                display_items.append((f"🖼️  {item.name}", item))
+                        
+                        self.root.after(0, lambda items=display_items: self._insert_items_batch(items))
+                        time.sleep(0.01)
+                    
+                    if total_items > self.MAX_ITEMS_DISPLAY:
+                        msg = f"  ⚠️  Mostrando {self.MAX_ITEMS_DISPLAY} de {total_items} items"
+                        self.root.after(0, lambda: self.listbox.insert(tk.END, msg))
+                    
+                    if not items:
+                        self.root.after(0, lambda: self.listbox.insert(tk.END, ""))
+                        self.root.after(0, lambda: self.listbox.insert(tk.END, "  📭  Sin archivos compatibles"))
+                        self.root.after(0, lambda: self.listbox.insert(tk.END, "  📄  Formatos: PDF, PPTX, PNG, JPG"))
+                    else:
+                        self.root.after(0, self._select_first_item)
+                        
+                except Exception as e:
+                    self.root.after(0, lambda: self.listbox.insert(tk.END, f"  ❌  Error: {str(e)[:50]}"))
+                
+            finally:
+                self.root.after(0, lambda: self._show_loading(False))
+                self.root.after(0, self._focus_list)
+        
+        threading.Thread(target=load_thread, daemon=True).start()
+    
+    def _insert_items_batch(self, items):
+        """Inserta un lote de items"""
+        for display, item in items:
+            self.listbox.insert(tk.END, display)
+            self.current_items.append(item)
+    
+    def _select_first_item(self):
+        """Selecciona el primer item"""
+        if self.current_items:
+            self.listbox.selection_set(0)
+            self.listbox.activate(0)
+            self.listbox.see(0)
+    
+    def _open_item(self, e=None):
+        """Abre item seleccionado"""
+        if self.active_dialog or self.loading:
+            return
+        
+        sel = self.listbox.curselection()
+        if not sel or not self.current_items or sel[0] >= len(self.current_items):
+            return
+        
+        item = self.current_items[sel[0]]
+        
+        if item.is_dir():
+            self.current_path = str(item)
+            self._load_directory()
+        else:
+            self._open_file(item)
+    
+    def _open_file(self, item):
+        """Abre archivo"""
+        ext = item.suffix.lower()
+        filepath = str(item)
+        
+        print(f"[APERTURA] {filepath}")
+        
+        try:
+            for proc in self.active_processes[:]:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1)
+                except:
+                    try:
+                        proc.kill()
+                    except:
+                        pass
+            self.active_processes.clear()
+            
+            if ext == '.pdf':
+                self._open_pdf_file(filepath)
+                
+            elif ext in {'.pptx', '.ppt', '.odp'}:
+                self._open_pptx_optimized(filepath)
+                
+            elif ext in {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff'}:
+                self._open_image_file(filepath)
+                
+        except Exception as e:
+            print(f"[ERROR] {e}")
+            self._show_info_message("Error", f"No se pudo abrir:\n\n{str(e)}")
+    
+    def _open_pdf_file(self, filepath):
+        """Abre archivo PDF"""
+        if not self.pdf_viewer:
+            self._show_info_message("Error", 
+                "No hay visor PDF instalado.\n\n"
+                "Instala uno: sudo apt install okular")
+            return
+        
+        cmd = [self.pdf_viewer, '--presentation', filepath] if self.pdf_viewer == 'okular' else \
+              [self.pdf_viewer, '--presentation', '--fullscreen', filepath] if self.pdf_viewer == 'evince' else \
+              [self.pdf_viewer, filepath, ':presentation']
+        
+        proc = subprocess.Popen(cmd)
+        self.active_processes.append(proc)
+        print(f"[PDF] Abierto con {self.pdf_viewer}")
+    
+    def _open_pptx_optimized(self, filepath):
+        """Abre PPTX optimizado"""
+        filename = os.path.basename(filepath)
+        
+        pdf_cache_path = self._get_cached_pdf_path(filepath)
+        
+        if self._is_pdf_cache_valid(filepath, pdf_cache_path):
+            print(f"[PPTX] Usando PDF en cache: {os.path.basename(pdf_cache_path)}")
+            self._open_pdf_file(pdf_cache_path)
+            return
+        
+        print(f"[PPTX] Iniciando conversión para: {filename}")
+        
+        converting_msg = self._show_converting_message(filename)
+        self.root.update()
+        
+        pdf_path = self._convert_pptx_to_pdf_optimized(filepath)
+        
+        if converting_msg and converting_msg.winfo_exists():
+            converting_msg.destroy()
+        
+        if pdf_path and os.path.exists(pdf_path):
+            print(f"[PPTX] ✓ Conversión exitosa, abriendo PDF...")
+            self._open_pdf_file(pdf_path)
+        else:
+            print(f"[PPTX] ⚠️ Conversión falló, usando LibreOffice directo")
+            self._open_pptx_fallback(filepath)
+    
+    def _open_pptx_fallback(self, filepath):
+        """Fallback: abre PPTX directamente con LibreOffice"""
+        print("[PPTX-FALLBACK] Usando LibreOffice Impress...")
+        
+        proc = subprocess.Popen([
+            'libreoffice',
+            '--impress',
+            '--show',
+            filepath
+        ])
+        
+        self.active_processes.append(proc)
+    
+    def _open_image_file(self, filepath):
+        """Abre imágenes"""
+        imgs = sorted([str(f) for f in Path(self.current_path).iterdir()
+                      if f.suffix.lower() in {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff'}])
+        
+        if imgs:
+            proc = subprocess.Popen(['feh', '-F', '-Z', '--auto-rotate',
+                                    '--slideshow-delay', '5', '--cycle-once',
+                                    '--start-at', filepath] + imgs)
+            self.active_processes.append(proc)
+            print("[IMG] Abierto con feh")
+    
+    def _go_back(self):
+        """Navega hacia atrás - CORREGIDO"""
+        if self.active_dialog or self.loading:
+            return
+        
+        if not self.current_usb_root:
+            return
+        
+        try:
+            rel = os.path.relpath(self.current_path, self.current_usb_root)
+        except:
+            rel = "."
+        
+        if rel == '.':
+            # Estamos en la raíz del USB
+            if len(self.usb_devices) > 1:
+                # Hay múltiples USB, mostrar selector
+                self._show_usb_selector()
+            else:
+                # Solo hay un USB
+                self._show_info_message("Información", 
+                    "Estás en la raíz del USB.\n"
+                    "Para cambiar de dispositivo, selecciona otro USB.")
+            return
+        
+        parent = Path(self.current_path).parent
+        if str(parent) != self.current_path:
+            self.current_path = str(parent)
+            self._load_directory()
+    
+    def _move_selection(self, direction):
+        """Mueve selección en lista"""
+        if not self.current_items:
+            return
+        
+        current = self.listbox.curselection()
+        
+        if not current:
+            self.listbox.selection_set(0)
+            self.listbox.activate(0)
+            self.listbox.see(0)
+            return
+        
+        new_idx = current[0] + direction
+        
+        if 0 <= new_idx < len(self.current_items):
+            self.listbox.selection_clear(0, tk.END)
+            self.listbox.selection_set(new_idx)
+            self.listbox.activate(new_idx)
+            self.listbox.see(new_idx)
+    
+    def close_app(self, e=None):
+        """Cierra aplicación"""
+        self.monitoring = False
+        self._cleanup()
+        time.sleep(0.3)
+        print("[SISTEMA] Cerrado")
+        self.root.quit()
+        sys.exit(0)
+
+if __name__ == "__main__":
+    os.environ['GDK_BACKEND'] = 'x11'
+    
+    print("=" * 80)
+    print("SISTEMA DE PRESENTACIONES USB - RASPBERRY PI")
+    print("VERSIÓN FINAL CORREGIDA - NAVEGACIÓN USB ARREGLADA")
+    print("=" * 80)
+    print("CORRECCIONES IMPLEMENTADAS:")
+    print("  ✓ Navegación en selector USB corregida (flechas arriba/abajo)")
+    print("  ✓ ESC/F5 con múltiples USB corregido")
+    print("  ✓ F5 recarga directorio actual si ya hay USB seleccionado")
+    print("  ✓ Conversión PPTX optimizada (cache temporal)")
+    print("=" * 80)
+    
+    try:
+        root = tk.Tk()
+        app = SimplePresenter(root)
+        root.protocol("WM_DELETE_WINDOW", app.close_app)
+        root.mainloop()
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrumpido")
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        import traceback
+        traceback.print_exc()
