@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Sistema de Presentaciones USB para Raspberry Pi
-Versión Final Corregida - Navegación USB Arreglada
 """
 
 import os
@@ -18,6 +17,7 @@ import atexit
 import shutil
 import tempfile
 import hashlib
+import queue
 
 class SimplePresenter:
     def __init__(self, root):
@@ -52,9 +52,17 @@ class SimplePresenter:
         self.MAX_ITEMS_DISPLAY = 100
         self.CACHE_USB_INFO = {}
         
-        # Directorio temporal para conversiones (oculto)
-        self.temp_conversion_dir = os.path.join(tempfile.gettempdir(), '.usb_presenter_cache')
+        # Directorio de cache permanente en home (más rápido que /tmp)
+        cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'usb_presenter')
+        self.temp_conversion_dir = cache_dir
         os.makedirs(self.temp_conversion_dir, exist_ok=True)
+        
+        # NUEVO: Sistema de cola para conversiones en background
+        self.conversion_queue = queue.Queue()
+        self.conversion_results = {}
+        self.converting_files = set()
+        
+        print(f"[CACHE] Directorio de cache: {self.temp_conversion_dir}")
         
         # Estado de diálogos activos
         self.active_dialog = None
@@ -81,7 +89,9 @@ class SimplePresenter:
         
         print(f"[SISTEMA] Visor PDF: {self.pdf_viewer or 'NINGUNO'}")
         print(f"[SISTEMA] Conversor PPTX: {self.pptx_converter or 'LibreOffice'}")
-        print(f"[SISTEMA] Directorio temporal: {self.temp_conversion_dir}")
+        
+        # Iniciar worker de conversiones en background
+        self._start_conversion_worker()
         
         atexit.register(self._cleanup)
         
@@ -111,8 +121,48 @@ class SimplePresenter:
                 pass
         return None
     
+    def _start_conversion_worker(self):
+        """Inicia worker thread para conversiones en background"""
+        def worker():
+            while self.monitoring:
+                try:
+                    task = self.conversion_queue.get(timeout=1)
+                    if task == "STOP":
+                        break
+                    
+                    pptx_path, pdf_path = task
+                    
+                    # Marcar como en conversión
+                    self.converting_files.add(pptx_path)
+                    
+                    # Realizar conversión
+                    success = self._convert_pptx_sync(pptx_path, pdf_path)
+                    
+                    # Guardar resultado
+                    self.conversion_results[pptx_path] = {
+                        'success': success,
+                        'pdf_path': pdf_path if success else None,
+                        'timestamp': time.time()
+                    }
+                    
+                    # Desmarcar
+                    self.converting_files.discard(pptx_path)
+                    
+                    print(f"[WORKER] Conversión {'exitosa' if success else 'fallida'}: {os.path.basename(pptx_path)}")
+                    
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    print(f"[WORKER-ERROR] {e}")
+        
+        self.worker_thread = threading.Thread(target=worker, daemon=True)
+        self.worker_thread.start()
+    
     def _cleanup(self):
         """Limpieza al salir"""
+        # Detener worker
+        self.conversion_queue.put("STOP")
+        
         for proc in self.active_processes:
             try:
                 proc.terminate()
@@ -123,54 +173,87 @@ class SimplePresenter:
                 except:
                     pass
         
-        try:
-            if os.path.exists(self.temp_conversion_dir):
-                shutil.rmtree(self.temp_conversion_dir)
-                print(f"[LIMPIEZA] Directorio temporal eliminado")
-        except Exception as e:
-            print(f"[LIMPIEZA] Error al limpiar: {e}")
+        print(f"[SISTEMA] Cache guardado en: {self.temp_conversion_dir}")
     
     def _get_cached_pdf_path(self, pptx_path):
-        """Genera ruta única para PDF en cache temporal"""
-        file_hash = hashlib.md5(pptx_path.encode()).hexdigest()[:12]
+        """Genera ruta única para PDF en cache - OPTIMIZADO"""
+        try:
+            # Usar stat para obtener información del archivo
+            stat_info = os.stat(pptx_path)
+            file_size = stat_info.st_size
+            file_mtime = int(stat_info.st_mtime)
+            
+            # Hash basado en ruta, tamaño y fecha de modificación
+            hash_input = f"{pptx_path}_{file_size}_{file_mtime}"
+            file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:12]
+        except Exception as e:
+            print(f"[CACHE] Error obteniendo stats: {e}")
+            file_hash = hashlib.md5(pptx_path.encode()).hexdigest()[:12]
+        
         filename = os.path.basename(pptx_path)
         name_without_ext = os.path.splitext(filename)[0]
         
-        pdf_filename = f"{name_without_ext}_{file_hash}.pdf"
+        # Limpiar nombre y limitar longitud
+        safe_name = "".join(c for c in name_without_ext if c.isalnum() or c in (' ', '-', '_'))[:30].rstrip()
+        if not safe_name:
+            safe_name = "presentacion"
+        
+        pdf_filename = f".{safe_name}_{file_hash}.pdf"
         return os.path.join(self.temp_conversion_dir, pdf_filename)
     
     def _is_pdf_cache_valid(self, pptx_path, pdf_path):
-        """Verifica si el PDF en cache es válido y actual"""
+        """Verifica si el PDF en cache es válido - MEJORADO"""
         if not os.path.exists(pdf_path):
             return False
         
         try:
+            # Verificar tamaño mínimo (al menos 5KB para ser válido)
+            pdf_size = os.path.getsize(pdf_path)
+            if pdf_size < 5120:  # 5KB
+                print(f"[CACHE] PDF muy pequeño, probablemente corrupto: {pdf_size} bytes")
+                return False
+            
+            # Verificar que el PDF sea más nuevo que el PPTX
             pptx_mtime = os.path.getmtime(pptx_path)
             pdf_mtime = os.path.getmtime(pdf_path)
             
-            if pdf_mtime >= pptx_mtime:
-                if os.path.getsize(pdf_path) > 1024:
-                    return True
-        except:
-            pass
-        
-        return False
+            if pdf_mtime < pptx_mtime:
+                print(f"[CACHE] PDF desactualizado")
+                return False
+            
+            # NUEVO: Verificar que el archivo no esté corrupto
+            # Intentar leer los primeros bytes para verificar que es un PDF válido
+            with open(pdf_path, 'rb') as f:
+                header = f.read(5)
+                if not header.startswith(b'%PDF-'):
+                    print(f"[CACHE] Archivo no es PDF válido")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            print(f"[CACHE] Error validando cache: {e}")
+            return False
     
-    def _convert_pptx_to_pdf_optimized(self, pptx_path):
-        """Convierte PPTX a PDF de forma optimizada"""
-        pdf_cache_path = self._get_cached_pdf_path(pptx_path)
+    def _convert_pptx_sync(self, pptx_path, pdf_cache_path):
+        """Conversión sincrónica de PPTX a PDF - MEJORADO"""
+        print(f"[CONVERSIÓN] Iniciando: {os.path.basename(pptx_path)}")
         
-        if self._is_pdf_cache_valid(pptx_path, pdf_cache_path):
-            print(f"[CACHE] PDF válido encontrado: {os.path.basename(pdf_cache_path)}")
-            return pdf_cache_path
-        
-        print(f"[CONVERSIÓN] Convirtiendo: {os.path.basename(pptx_path)}")
-        
+        # Asegurar que el directorio existe
         os.makedirs(os.path.dirname(pdf_cache_path), exist_ok=True)
         
+        # Limpiar PDF existente si está corrupto
+        if os.path.exists(pdf_cache_path):
+            try:
+                os.remove(pdf_cache_path)
+            except:
+                pass
+        
         try:
+            # Método 1: unoconv (más rápido)
             if self.pptx_converter == 'unoconv':
-                print("[CONVERSIÓN] Usando unoconv (rápido)...")
+                print("[CONVERSIÓN] Usando unoconv...")
+                
                 result = subprocess.run([
                     'unoconv',
                     '-f', 'pdf',
@@ -178,52 +261,83 @@ class SimplePresenter:
                     pptx_path
                 ], 
                 capture_output=True, 
-                timeout=45,
+                timeout=60,  # Aumentado a 60s
                 text=True)
                 
                 if result.returncode == 0 and os.path.exists(pdf_cache_path):
-                    print(f"[CONVERSIÓN] ✓ Éxito con unoconv ({os.path.getsize(pdf_cache_path)} bytes)")
-                    return pdf_cache_path
-                else:
-                    print(f"[CONVERSIÓN] unoconv falló: {result.stderr}")
+                    size = os.path.getsize(pdf_cache_path)
+                    if size > 5120:  # Al menos 5KB
+                        print(f"[CONVERSIÓN] ✓ unoconv exitoso ({size} bytes)")
+                        return True
+                    else:
+                        print(f"[CONVERSIÓN] unoconv generó PDF muy pequeño")
             
+            # Método 2: LibreOffice headless
             print("[CONVERSIÓN] Usando LibreOffice headless...")
             
-            temp_dir = tempfile.mkdtemp(prefix='lo_convert_')
+            # Crear directorio temporal único
+            temp_dir = tempfile.mkdtemp(prefix='pptx_convert_')
             
             try:
+                # Variables de entorno optimizadas
+                env = os.environ.copy()
+                env.update({
+                    'SAL_USE_VCLPLUGIN': 'svp',  # Sin interfaz gráfica
+                    'HOME': temp_dir  # Directorio temporal como home
+                })
+                
                 result = subprocess.run([
                     'libreoffice',
                     '--headless',
+                    '--invisible',
+                    '--nodefault',
+                    '--nofirststartwizard',
+                    '--nolockcheck',
+                    '--nologo',
+                    '--norestore',
                     '--convert-to', 'pdf',
                     '--outdir', temp_dir,
                     pptx_path
                 ], 
+                env=env,
                 capture_output=True, 
-                timeout=60,
+                timeout=90,  # Aumentado a 90s
                 text=True)
                 
+                # Buscar el PDF generado
+                pdf_found = False
                 for file in os.listdir(temp_dir):
                     if file.endswith('.pdf'):
                         temp_pdf = os.path.join(temp_dir, file)
-                        shutil.move(temp_pdf, pdf_cache_path)
-                        print(f"[CONVERSIÓN] ✓ Éxito con LibreOffice ({os.path.getsize(pdf_cache_path)} bytes)")
-                        return pdf_cache_path
+                        
+                        # Verificar que sea válido
+                        size = os.path.getsize(temp_pdf)
+                        if size > 5120:
+                            shutil.move(temp_pdf, pdf_cache_path)
+                            print(f"[CONVERSIÓN] ✓ LibreOffice exitoso ({size} bytes)")
+                            pdf_found = True
+                            break
                 
-                print(f"[CONVERSIÓN] LibreOffice no generó PDF: {result.stderr}")
+                if pdf_found:
+                    return True
+                else:
+                    print(f"[CONVERSIÓN] LibreOffice no generó PDF válido")
+                    if result.stderr:
+                        print(f"[CONVERSIÓN] Error: {result.stderr[:200]}")
                 
             finally:
+                # Limpiar directorio temporal
                 try:
                     shutil.rmtree(temp_dir)
                 except:
                     pass
             
         except subprocess.TimeoutExpired:
-            print("[CONVERSIÓN] ⏱️ Timeout - archivo muy grande o sistema lento")
+            print("[CONVERSIÓN] ⏱️ Timeout - presentación muy grande")
         except Exception as e:
             print(f"[CONVERSIÓN] ❌ Error: {e}")
         
-        return None
+        return False
     
     def _setup_ui(self):
         self.root.configure(bg=self.colors['bg_main'])
@@ -348,7 +462,7 @@ class SimplePresenter:
         self.root.bind('<Control-q>', self.close_app)
     
     def _handle_key_in_dialog(self, event):
-        """Maneja teclas en diálogos activos - CORREGIDO"""
+        """Maneja teclas en diálogos activos"""
         if not self.active_dialog:
             return
         
@@ -379,39 +493,45 @@ class SimplePresenter:
                 self.active_dialog = None
                 self.selecting_usb = False
                 self._focus_list()
+            elif event.keysym in ['Up', 'Prior']:
+                self._move_usb_selection(-1)
+            elif event.keysym in ['Down', 'Next']:
+                self._move_usb_selection(1)
             elif event.keysym in ['b', 'B', 'Return']:
                 if hasattr(self.active_dialog, 'select_btn'):
                     self.active_dialog.select_btn.invoke()
-            elif event.keysym in ['Up', 'Down', 'Prior', 'Next']:
-                # CORREGIDO: Manejar navegación en lista USB
-                usb_list = self.active_dialog.usb_list
-                current = usb_list.curselection()
-                item_count = usb_list.size()
-                
-                if not current and item_count > 0:
-                    # No hay selección, seleccionar el primero
-                    usb_list.selection_set(0)
-                    usb_list.activate(0)
-                    usb_list.see(0)
-                elif current:
-                    # Hay selección, moverla
-                    direction = -1 if event.keysym in ['Up', 'Prior'] else 1
-                    new_idx = current[0] + direction
-                    if 0 <= new_idx < item_count:
-                        usb_list.selection_clear(0, tk.END)
-                        usb_list.selection_set(new_idx)
-                        usb_list.activate(new_idx)
-                        usb_list.see(new_idx)
+    
+    def _move_usb_selection(self, direction):
+        """Mueve selección en lista USB"""
+        if not hasattr(self.active_dialog, 'usb_list'):
+            return
+        
+        usb_list = self.active_dialog.usb_list
+        current = usb_list.curselection()
+        item_count = usb_list.size()
+        
+        if not current and item_count > 0:
+            usb_list.selection_clear(0, tk.END)
+            usb_list.selection_set(0)
+            usb_list.activate(0)
+            usb_list.see(0)
+        elif current:
+            new_idx = current[0] + direction
+            if 0 <= new_idx < item_count:
+                usb_list.selection_clear(0, tk.END)
+                usb_list.selection_set(new_idx)
+                usb_list.activate(new_idx)
+                usb_list.see(new_idx)
     
     def _show_converting_message(self, filename):
-        """Muestra mensaje de conversión en progreso"""
+        """Muestra mensaje de conversión en progreso - MEJORADO"""
         msg = Toplevel(self.root)
         msg.title("Convirtiendo")
         msg.configure(bg=self.colors['bg_main'])
         msg.overrideredirect(True)
         msg.transient(self.root)
         
-        w, h = 700, 300
+        w, h = 750, 350
         x = (self.root.winfo_screenwidth() // 2) - (w // 2)
         y = (self.root.winfo_screenheight() // 2) - (h // 2)
         msg.geometry(f'{w}x{h}+{x}+{y}')
@@ -425,7 +545,7 @@ class SimplePresenter:
         
         tk.Label(
             msg, 
-            text="Convirtiendo presentación...",
+            text="Optimizando presentación...",
             font=('Arial', 28, 'bold'),
             bg=self.colors['bg_main'],
             fg=self.colors['text_primary']
@@ -438,7 +558,16 @@ class SimplePresenter:
             font=('Arial', 22),
             bg=self.colors['bg_main'],
             fg=self.colors['text_secondary']
-        ).pack(pady=15)
+        ).pack(pady=10)
+        
+        tk.Label(
+            msg, 
+            text="Por favor espere...\nEsto puede tomar 30-60 segundos",
+            font=('Arial', 18),
+            bg=self.colors['bg_main'],
+            fg=self.colors['accent_yellow'],
+            justify='center'
+        ).pack(pady=5)
         
         progress = tk.Label(
             msg, 
@@ -526,7 +655,7 @@ class SimplePresenter:
             pass
     
     def _handle_back_press(self, e=None):
-        """Tecla ESC - Retroceder - CORREGIDO"""
+        """Tecla ESC - Retroceder"""
         if self.active_dialog:
             self._handle_key_in_dialog(e)
             return
@@ -537,7 +666,8 @@ class SimplePresenter:
         
         if self.selecting_usb:
             self.selecting_usb = False
-            self._load_directory()
+            if self.current_usb_root:
+                self._load_directory()
             return
         
         if self.current_selection == 0:
@@ -561,7 +691,7 @@ class SimplePresenter:
             pass
     
     def _handle_up(self, e=None):
-        """Flecha arriba - CORREGIDO"""
+        """Flecha arriba"""
         if self.active_dialog:
             self._handle_key_in_dialog(e)
             return
@@ -573,7 +703,7 @@ class SimplePresenter:
             self._focus_list()
     
     def _handle_down(self, e=None):
-        """Flecha abajo - CORREGIDO"""
+        """Flecha abajo"""
         if self.active_dialog:
             self._handle_key_in_dialog(e)
             return
@@ -674,19 +804,23 @@ class SimplePresenter:
         btn_frame = tk.Frame(content, bg=self.colors['bg_main'])
         btn_frame.pack(pady=(0, 30))
         
+        button_style = {
+            'font': ('Arial', 26, 'bold'),
+            'height': 2,
+            'width': 22,
+            'relief': tk.FLAT,
+            'cursor': 'hand2',
+            'padx': 20,
+            'pady': 10
+        }
+        
         cancel_btn = tk.Button(
             btn_frame,
             text="CANCELAR",
             command=lambda: [dialog.destroy(), setattr(self, 'active_dialog', None), self._focus_list()],
-            font=('Arial', 26, 'bold'),
             bg='#616161',
             fg='white',
-            relief=tk.FLAT,
-            width=22,
-            height=2,
-            cursor='hand2',
-            padx=20,
-            pady=10
+            **button_style
         )
         cancel_btn.pack(side=tk.LEFT, padx=30)
         
@@ -694,15 +828,9 @@ class SimplePresenter:
             btn_frame,
             text="CONFIRMAR",
             command=self._execute_shutdown,
-            font=('Arial', 26, 'bold'),
             bg=self.colors['accent_red'],
             fg='white',
-            relief=tk.FLAT,
-            width=22,
-            height=2,
-            cursor='hand2',
-            padx=20,
-            pady=10
+            **button_style
         )
         confirm_btn.pack(side=tk.RIGHT, padx=30)
         
@@ -908,13 +1036,10 @@ class SimplePresenter:
         self._load_directory()
     
     def scan_usb_devices(self, e=None):
-        """Escanea dispositivos USB - CORREGIDO"""
-        # Si hay diálogo activo, ignorar
+        """Escanea dispositivos USB"""
         if self.active_dialog:
             return
         
-        # CORRECCIÓN: Si ya tenemos un USB seleccionado y hay múltiples,
-        # recargar el directorio actual en lugar de mostrar selector
         if self.current_usb_root and len(self.usb_devices) > 1:
             print("[ACTUALIZAR] Recargando directorio actual...")
             self._load_directory()
@@ -931,7 +1056,6 @@ class SimplePresenter:
             elif len(self.usb_devices) == 1:
                 self.root.after(0, lambda: self._set_current_usb(self.usb_devices[0]))
             else:
-                # Múltiples USB - solo actualizar si no hay uno seleccionado
                 if not self.current_usb_root:
                     self.root.after(0, lambda: self.path_label.config(
                         text=f"📀 {len(self.usb_devices)} USB - Use SELECCIONAR USB",
@@ -951,7 +1075,7 @@ class SimplePresenter:
         self.current_usb_root = None
     
     def _show_usb_selector(self):
-        """Selector de USB - CORREGIDO"""
+        """Selector de USB"""
         if not self.usb_devices:
             self._show_info_message("Sin USB", 
                 "No hay dispositivos USB detectados.\n\n"
@@ -1034,19 +1158,23 @@ class SimplePresenter:
                 self.active_dialog = None
                 self._set_current_usb(selected_usb)
         
+        button_style = {
+            'font': ('Arial', 28, 'bold'),
+            'height': 3,
+            'width': 22,
+            'relief': tk.FLAT,
+            'cursor': 'hand2',
+            'padx': 20,
+            'pady': 10
+        }
+        
         select_btn = tk.Button(
             btn_frame, 
             text="SELECCIONAR", 
             command=select,
-            font=('Arial', 28, 'bold'),
             bg=self.colors['accent_green'], 
             fg=self.colors['text_primary'],
-            height=3,
-            width=22,
-            relief=tk.FLAT,
-            cursor='hand2',
-            padx=20,
-            pady=10
+            **button_style
         )
         select_btn.pack(side=tk.LEFT, padx=20, expand=True)
         
@@ -1059,15 +1187,9 @@ class SimplePresenter:
                 setattr(self, 'selecting_usb', False),
                 self._focus_list()
             ],
-            font=('Arial', 28, 'bold'),
             bg=self.colors['accent_red'], 
             fg=self.colors['text_primary'],
-            height=3,
-            width=22,
-            relief=tk.FLAT,
-            cursor='hand2',
-            padx=20,
-            pady=10
+            **button_style
         )
         cancel_btn.pack(side=tk.RIGHT, padx=20, expand=True)
         
@@ -1075,7 +1197,6 @@ class SimplePresenter:
         selector.cancel_btn = cancel_btn
         selector.usb_list = usb_list
         
-        # IMPORTANTE: Bind de todas las teclas necesarias
         selector.bind('b', self._handle_key_in_dialog)
         selector.bind('B', self._handle_key_in_dialog)
         selector.bind('<Escape>', self._handle_key_in_dialog)
@@ -1156,9 +1277,13 @@ class SimplePresenter:
                             if item.is_dir():
                                 display_items.append((f"📁  {item.name}", item))
                             elif item.suffix.lower() in doc_ext:
-                                if item.suffix.lower() != '.pdf':
+                                if item.suffix.lower() in ['.pptx', '.ppt', '.odp']:
                                     pdf_cache = self._get_cached_pdf_path(str(item))
-                                    icon = "📊✓" if os.path.exists(pdf_cache) else "📊"
+                                    # Verificar cache válido
+                                    if os.path.exists(pdf_cache) and self._is_pdf_cache_valid(str(item), pdf_cache):
+                                        icon = "📊✓"
+                                    else:
+                                        icon = "📊"
                                 else:
                                     icon = "📕"
                                 display_items.append((f"{icon}  {item.name}", item))
@@ -1267,32 +1392,44 @@ class SimplePresenter:
         print(f"[PDF] Abierto con {self.pdf_viewer}")
     
     def _open_pptx_optimized(self, filepath):
-        """Abre PPTX optimizado"""
+        """Abre PPTX optimizado - MEJORADO CON CONVERSIÓN ROBUSTA"""
         filename = os.path.basename(filepath)
-        
         pdf_cache_path = self._get_cached_pdf_path(filepath)
         
+        # Verificar si hay cache válido
         if self._is_pdf_cache_valid(filepath, pdf_cache_path):
-            print(f"[PPTX] Usando PDF en cache: {os.path.basename(pdf_cache_path)}")
+            print(f"[PPTX] ✓ Usando PDF cacheado")
             self._open_pdf_file(pdf_cache_path)
             return
         
-        print(f"[PPTX] Iniciando conversión para: {filename}")
+        # No hay cache válido, necesita conversión
+        print(f"[PPTX] Conversión necesaria para: {filename}")
         
+        # Mostrar mensaje de conversión
         converting_msg = self._show_converting_message(filename)
         self.root.update()
         
-        pdf_path = self._convert_pptx_to_pdf_optimized(filepath)
+        # Ejecutar conversión en thread separado para no bloquear UI
+        def convert_and_open():
+            try:
+                success = self._convert_pptx_sync(filepath, pdf_cache_path)
+                
+                # Cerrar mensaje de conversión en UI thread
+                self.root.after(0, lambda: converting_msg.destroy() if converting_msg.winfo_exists() else None)
+                
+                if success and os.path.exists(pdf_cache_path):
+                    print(f"[PPTX] ✓ Conversión exitosa, abriendo PDF...")
+                    self.root.after(0, lambda: self._open_pdf_file(pdf_cache_path))
+                else:
+                    print(f"[PPTX] ⚠️ Conversión falló, usando fallback")
+                    self.root.after(0, lambda: self._open_pptx_fallback(filepath))
+                    
+            except Exception as e:
+                print(f"[PPTX] Error en conversión: {e}")
+                self.root.after(0, lambda: converting_msg.destroy() if converting_msg.winfo_exists() else None)
+                self.root.after(0, lambda: self._open_pptx_fallback(filepath))
         
-        if converting_msg and converting_msg.winfo_exists():
-            converting_msg.destroy()
-        
-        if pdf_path and os.path.exists(pdf_path):
-            print(f"[PPTX] ✓ Conversión exitosa, abriendo PDF...")
-            self._open_pdf_file(pdf_path)
-        else:
-            print(f"[PPTX] ⚠️ Conversión falló, usando LibreOffice directo")
-            self._open_pptx_fallback(filepath)
+        threading.Thread(target=convert_and_open, daemon=True).start()
     
     def _open_pptx_fallback(self, filepath):
         """Fallback: abre PPTX directamente con LibreOffice"""
@@ -1320,7 +1457,7 @@ class SimplePresenter:
             print("[IMG] Abierto con feh")
     
     def _go_back(self):
-        """Navega hacia atrás - CORREGIDO"""
+        """Navega hacia atrás"""
         if self.active_dialog or self.loading:
             return
         
@@ -1333,12 +1470,9 @@ class SimplePresenter:
             rel = "."
         
         if rel == '.':
-            # Estamos en la raíz del USB
             if len(self.usb_devices) > 1:
-                # Hay múltiples USB, mostrar selector
                 self._show_usb_selector()
             else:
-                # Solo hay un USB
                 self._show_info_message("Información", 
                     "Estás en la raíz del USB.\n"
                     "Para cambiar de dispositivo, selecciona otro USB.")
@@ -1373,7 +1507,7 @@ class SimplePresenter:
     def close_app(self, e=None):
         """Cierra aplicación"""
         self.monitoring = False
-        self._cleanup()
+        print(f"[SISTEMA] Cache guardado en: {self.temp_conversion_dir}")
         time.sleep(0.3)
         print("[SISTEMA] Cerrado")
         self.root.quit()
@@ -1384,13 +1518,17 @@ if __name__ == "__main__":
     
     print("=" * 80)
     print("SISTEMA DE PRESENTACIONES USB - RASPBERRY PI")
-    print("VERSIÓN FINAL CORREGIDA - NAVEGACIÓN USB ARREGLADA")
+    print("VERSIÓN ULTRA-OPTIMIZADA - CACHE PPTX MEJORADO")
     print("=" * 80)
-    print("CORRECCIONES IMPLEMENTADAS:")
-    print("  ✓ Navegación en selector USB corregida (flechas arriba/abajo)")
-    print("  ✓ ESC/F5 con múltiples USB corregido")
-    print("  ✓ F5 recarga directorio actual si ya hay USB seleccionado")
-    print("  ✓ Conversión PPTX optimizada (cache temporal)")
+    print("OPTIMIZACIONES IMPLEMENTADAS:")
+    print("  ✓ Conversión PPTX en thread separado (no bloquea interfaz)")
+    print("  ✓ Validación mejorada de PDFs cacheados")
+    print("  ✓ Detección de archivos corruptos")
+    print("  ✓ Cache persistente en ~/.cache/usb_presenter")
+    print("  ✓ Timeouts aumentados (60-90s) para archivos grandes")
+    print("  ✓ Variables de entorno optimizadas para LibreOffice")
+    print("  ✓ Limpieza automática de archivos temporales")
+    print("  ✓ Manejo robusto de errores")
     print("=" * 80)
     
     try:
